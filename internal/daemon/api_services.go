@@ -100,6 +100,17 @@ func v1PostServices(c *Command, r *http.Request, _ *userState) Response {
 	var taskSet *state.TaskSet
 	var services []string
 	switch payload.Action {
+	case "stop-extend":
+		services, err = servmgr.StopOrder(payload.Services)
+		if err != nil {
+			break
+		}
+
+		err = servmgr.StopExtend(services)
+		if err != nil {
+			break
+		}
+		return AsyncResponse(nil, "")
 	case "start", "autostart":
 		services, err = servmgr.StartOrder(payload.Services)
 		if err != nil {

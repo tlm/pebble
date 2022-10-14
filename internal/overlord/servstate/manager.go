@@ -89,6 +89,19 @@ func (m *ServiceManager) NotifyPlanChanged(f PlanFunc) {
 	m.planHandlers = append(m.planHandlers, f)
 }
 
+func (m *ServiceManager) StopExtend(services []string) error {
+	m.servicesLock.Lock()
+	defer m.servicesLock.Unlock()
+
+	for _, svc := range m.services {
+		if err := svc.StopExtend(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (m *ServiceManager) updatePlan(p *plan.Plan) {
 	m.plan = p
 	for _, f := range m.planHandlers {

@@ -51,6 +51,11 @@ func (client *Client) Replan(opts *ServiceOptions) (changeID string, err error) 
 	return changeID, err
 }
 
+func (client *Client) StopExtend(opts *ServiceOptions) (changeID string, err error) {
+	_, _, err = client.doMultiServiceAction("stop-extend", opts.Names)
+	return "", err
+}
+
 type multiActionData struct {
 	Action   string   `json:"action"`
 	Services []string `json:"services"`

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/user"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,7 +56,7 @@ func TaskServiceRequest(task *state.Task) (*ServiceRequest, error) {
 
 var (
 	okayWait = 1 * time.Second
-	killWait = 5 * time.Second
+	killWait = 20 * time.Second
 	failWait = 10 * time.Second
 )
 
@@ -83,6 +84,9 @@ const (
 
 // serviceData holds the state and other data for a service under our control.
 type serviceData struct {
+	// lock is the concurrency leaver used for changing the internal state of
+	// serviceData or for performing safe reads.
+	lock        sync.Mutex
 	manager     *ServiceManager
 	state       serviceState
 	config      *plan.Service
@@ -95,6 +99,7 @@ type serviceData struct {
 	resetTimer  *time.Timer
 	restarting  bool
 	restarts    int
+	killTimer   *time.Timer
 }
 
 func (m *ServiceManager) doStart(task *state.Task, tomb *tomb.Tomb) error {
@@ -276,13 +281,31 @@ func (m *ServiceManager) removeService(name string) {
 	delete(m.services, name)
 }
 
-// transition changes the service's state machine to the given state.
+func (s *serviceData) StopExtend() error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	switch s.state {
+	case stateTerminating:
+		if s.killTimer != nil {
+			s.killTimer.Reset(30 * time.Second)
+			logger.Noticef("resseting kill timer for service %s for 30 seconds longer", s.config.Name)
+		}
+	default:
+		return fmt.Errorf("cannot extend stop timeout for service while %s", s.state)
+	}
+	return nil
+}
+
+// transition changes the service's state machine to the given state. It's
+// expected the caller of this func holds the serviceData's lock.
 func (s *serviceData) transition(state serviceState) {
 	logger.Debugf("Service %q transitioning to state %q", s.config.Name, state)
 	s.transitionRestarting(state, false)
 }
 
-// transitionRestarting changes the service's state and also sets the restarting flag.
+// transitionRestarting changes the service's state and also sets the restarting
+// flag. It's expected the caller of this func holds the serviceData's lock.
 func (s *serviceData) transitionRestarting(state serviceState, restarting bool) {
 	s.state = state
 	s.restarting = restarting
@@ -290,8 +313,8 @@ func (s *serviceData) transitionRestarting(state serviceState, restarting bool) 
 
 // start is called to transition from the initial state and start the service.
 func (s *serviceData) start() error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	switch s.state {
 	case stateInitial:
@@ -315,8 +338,8 @@ func logError(err error) {
 }
 
 // startInternal is an internal helper used to actually start (or restart) the
-// command. It assumes the caller has ensures the service is in a valid state,
-// and it sets s.cmd and other relevant fields.
+// command. It assumes the caller ensures the service is in a valid state, and
+// it sets s.cmd and other relevant fields.
 func (s *serviceData) startInternal() error {
 	args, err := shlex.Split(s.config.Command)
 	if err != nil {
@@ -427,8 +450,8 @@ func (s *serviceData) startInternal() error {
 // okayWaitElapsed is called when the okay-wait timer has elapsed (and the
 // service is considered running successfully).
 func (s *serviceData) okayWaitElapsed() error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	switch s.state {
 	case stateStarting:
@@ -444,8 +467,8 @@ func (s *serviceData) okayWaitElapsed() error {
 
 // exited is called when the service's process exits.
 func (s *serviceData) exited(exitCode int) error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	if s.resetTimer != nil {
 		s.resetTimer.Stop()
@@ -564,6 +587,9 @@ func getAction(config *plan.Service, success bool) (action plan.ServiceAction, o
 // sendSignal sends the given signal to a running service. Note that this
 // function doesn't lock; it assumes the caller will.
 func (s *serviceData) sendSignal(signal string) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	switch s.state {
 	case stateStarting, stateRunning:
 		sig := unix.SignalNum(signal)
@@ -585,21 +611,49 @@ func (s *serviceData) sendSignal(signal string) error {
 	return nil
 }
 
-// stop is called to stop a running (or backing off) service.
+// stop is called to gracefully stop a running process by sending sigterm or
+// stopping a process that is in a backoff state.
 func (s *serviceData) stop() error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	switch s.state {
 	case stateRunning:
 		logger.Debugf("Attempting to stop service %q by sending SIGTERM", s.config.Name)
-		// First send SIGTERM to try to terminate it gracefully.
+		// Send SIGTERM to the process group to terminate gracefully.
 		err := syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
 		if err != nil {
 			logger.Noticef("Cannot send SIGTERM to process: %v", err)
 		}
 		s.transition(stateTerminating)
-		time.AfterFunc(killWait, func() { logError(s.terminateTimeElapsed()) })
+		s.killTimer = time.AfterFunc(killWait, func() { logError(s.terminateTimeElapsed()) })
+
+	case stateBackoff:
+		logger.Noticef("Service %q stopped while waiting for backoff", s.config.Name)
+		s.stopped <- nil
+		s.transition(stateStopped)
+
+	default:
+		return fmt.Errorf("cannot stop service while %s", s.state)
+	}
+	return nil
+}
+
+// kill is called to hard kill a running or terminating process or stopping a
+// process that is in a backoff state.
+func (s *serviceData) kill() error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	switch s.state {
+	case stateRunning, stateTerminating:
+		logger.Debugf("Attempting to kill service %q by sending SIGKILL", s.config.Name)
+		// Send SIGTERM to the process group to terminate gracefully.
+		err := syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+		if err != nil {
+			logger.Noticef("Cannot send SIGKILL to process: %v", err)
+		}
+		s.transition(stateKilling)
 
 	case stateBackoff:
 		logger.Noticef("Service %q stopped while waiting for backoff", s.config.Name)
@@ -615,8 +669,8 @@ func (s *serviceData) stop() error {
 // backoffTimeElapsed is called when the current backoff's timer has elapsed,
 // to restart the service.
 func (s *serviceData) backoffTimeElapsed() error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	switch s.state {
 	case stateBackoff:
@@ -634,11 +688,12 @@ func (s *serviceData) backoffTimeElapsed() error {
 	return nil
 }
 
+// TODO look at removing this func
 // terminateTimeElapsed is called after stop sends SIGTERM and the service
 // still hasn't exited (and we then send SIGTERM).
 func (s *serviceData) terminateTimeElapsed() error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	switch s.state {
 	case stateTerminating:
@@ -649,6 +704,7 @@ func (s *serviceData) terminateTimeElapsed() error {
 			logger.Noticef("Cannot send SIGKILL to process: %v", err)
 		}
 		s.transitionRestarting(stateKilling, s.restarting)
+		s.killTimer = nil
 		time.AfterFunc(failWait-killWait, func() { logError(s.killTimeElapsed()) })
 
 	default:
@@ -661,8 +717,8 @@ func (s *serviceData) terminateTimeElapsed() error {
 // killTimeElapsed is called some time after we've send SIGKILL to acknowledge
 // to stop's caller that we can't seem to stop the service.
 func (s *serviceData) killTimeElapsed() error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	switch s.state {
 	case stateKilling:
@@ -686,8 +742,8 @@ func (s *serviceData) killTimeElapsed() error {
 // (set to the backoff-limit value), indicating we should reset the backoff
 // time because the service is running successfully.
 func (s *serviceData) backoffResetElapsed() error {
-	s.manager.servicesLock.Lock()
-	defer s.manager.servicesLock.Unlock()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	switch s.state {
 	case stateRunning:
@@ -705,6 +761,9 @@ func (s *serviceData) backoffResetElapsed() error {
 
 // checkFailed handles a health check failure (from the check manager).
 func (s *serviceData) checkFailed(action plan.ServiceAction) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	switch s.state {
 	case stateRunning, stateBackoff, stateExited:
 		onType := "on-check-failure"

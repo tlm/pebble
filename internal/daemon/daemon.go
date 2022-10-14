@@ -543,7 +543,7 @@ var (
 var shutdownTimeout = time.Second
 
 // Stop shuts down the Daemon.
-func (d *Daemon) Stop(sigCh chan<- os.Signal) error {
+func (d *Daemon) Stop(timeout time.Duration, sigCh chan<- os.Signal) error {
 	if d.rebootIsMissing {
 		// we need to schedule/wait for a system restart again
 		return d.doReboot(sigCh, rebootRetryWaitTimeout)
@@ -555,7 +555,7 @@ func (d *Daemon) Stop(sigCh chan<- os.Signal) error {
 	// Stop all running services. Must do this before overlord.Stop, as it
 	// creates a change and waits for the change, and overlord.Stop calls
 	// StateEngine.Stop, which locks, so Ensure would result in a deadlock.
-	err := d.stopRunningServices()
+	err := d.stopRunningServices(timeout)
 	if err != nil {
 		// This isn't fatal for exiting the daemon, so log and continue.
 		logger.Noticef("Cannot stop running services: %v", err)
@@ -639,9 +639,9 @@ func (d *Daemon) Stop(sigCh chan<- os.Signal) error {
 // be exported, so just duplicate it here).
 const stopRunningTimeout = 5*time.Second + 100*time.Millisecond
 
-// stopRunningServices stops all running services, waiting for a short time
-// for them all to stop.
-func (d *Daemon) stopRunningServices() error {
+// stopRunningServices stops all running services, waiting for timeout for them
+// all to stop.
+func (d *Daemon) stopRunningServices(timeout time.Duration) error {
 	taskSet, err := servstate.StopRunning(d.state, d.overlord.ServiceManager())
 	if err != nil {
 		return err
@@ -664,8 +664,8 @@ func (d *Daemon) stopRunningServices() error {
 	select {
 	case <-chg.Ready():
 		logger.Debugf("All services stopped.")
-	case <-time.After(stopRunningTimeout):
-		return errors.New("timeout stopping running services")
+		//	case <-time.After(timeout):
+		//		return errors.New("timeout stopping running services")
 	}
 	return nil
 }

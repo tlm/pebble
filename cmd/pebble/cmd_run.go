@@ -15,6 +15,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -31,6 +32,10 @@ import (
 	"github.com/canonical/pebble/internal/systemd"
 )
 
+const (
+	defaultSigTimeout = 10 * time.Second
+)
+
 var shortRunHelp = "Run the pebble environment"
 var longRunHelp = `
 The run command starts pebble and runs the configured environment.
@@ -42,6 +47,7 @@ type cmdRun struct {
 	CreateDirs bool   `long:"create-dirs"`
 	Hold       bool   `long:"hold"`
 	HTTP       string `long:"http"`
+	SigTimeout string `long:"sig-timeout"`
 	Verbose    bool   `short:"v" long:"verbose"`
 }
 
@@ -51,6 +57,7 @@ func init() {
 			"create-dirs": "Create pebble directory on startup if it doesn't exist",
 			"hold":        "Do not start default services automatically",
 			"http":        `Start HTTP API listening on this address (e.g., ":4000")`,
+			"sig-timeout": "Timeout given to pebble services when sig term is sent",
 			"verbose":     "Log all output from services to stdout",
 		}, nil)
 }
@@ -115,6 +122,19 @@ func sanityCheck() error {
 
 func runDaemon(rcmd *cmdRun, ch chan os.Signal) error {
 	t0 := time.Now().Truncate(time.Millisecond)
+
+	sigTimeout := defaultSigTimeout
+	if rcmd.SigTimeout != "" {
+		var err error
+		sigTimeout, err = time.ParseDuration(rcmd.SigTimeout)
+		if err != nil {
+			return fmt.Errorf("sig timeout: %w", err)
+		}
+
+		if sigTimeout < time.Duration(0) {
+			return errors.New("cannot have a sig timeout less then 0")
+		}
+	}
 
 	pebbleDir, socketPath := getEnvPaths()
 	if rcmd.CreateDirs {
@@ -197,5 +217,5 @@ out:
 	// Close our own self-connection, otherwise it prevents fast and clean termination.
 	rcmd.client.CloseIdleConnections()
 
-	return d.Stop(ch)
+	return d.Stop(sigTimeout, ch)
 }
